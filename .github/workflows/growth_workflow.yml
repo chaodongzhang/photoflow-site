@@ -1,0 +1,139 @@
+name: Growth Docs CI
+
+on:
+  pull_request:
+    paths:
+      - 'growth/**'
+  workflow_dispatch:
+
+jobs:
+  validate-growth-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate growth docs
+        id: validate
+        run: |
+          python - << 'PY'
+          import re, os, sys, datetime, pathlib, textwrap, yaml
+
+          required_front_matter_keys = ["title","version","author","last_updated","status"]
+          ok = True
+          report_lines = []
+          now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+          root = pathlib.Path('growth')
+          if not root.exists():
+            print("No growth directory found; skipping.")
+            sys.exit(0)
+
+          md_files = list(root.rglob("*.md"))
+          patterns = {
+            "prd": re.compile(r"^PRD_[A-Za-z0-9\-]+_v\d+\.\d+\.md$"),
+            "strategy": re.compile(r"^.*_Strategy_SOP_v\d+\.\d+\.md$"),
+            "execution": re.compile(r"^.*_Execution_SOP_v\d+\.\d+\.md$"),
+            "readme": re.compile(r"^README.*\.md$"),
+            "report": re.compile(r"^\d{4}-\d{2}-.*\.md$"),
+          }
+
+          def check_filename(p: pathlib.Path):
+            name = p.name
+            # allow any README*.md
+            if patterns["readme"].match(name):
+              return True, "README ok"
+            # month reports in /reports
+            if p.parts and "reports" in p.parts and patterns["report"].match(name):
+              return True, "Report ok"
+            # strategy
+            if patterns["strategy"].match(name):
+              return True, "Strategy ok"
+            # execution
+            if patterns["execution"].match(name):
+              return True, "Execution ok"
+            # prd under execution allowed
+            if patterns["prd"].match(name):
+              return True, "PRD ok"
+            return False, f"Filename pattern not allowed: {name}"
+
+          def parse_front_matter(text: str):
+            if not text.startswith('---'):
+              return None, "Missing front matter delimiter '---' at start"
+            try:
+              end = text.find('\n---', 3)
+              if end == -1:
+                return None, "Missing closing front matter delimiter '---'"
+              fm_text = text[3:end].strip()
+              data = yaml.safe_load(fm_text) if fm_text else {}
+              return data, None
+            except Exception as e:
+              return None, f"YAML parse error: {e}"
+
+          for p in md_files:
+            # Skip images or non-md accidentally matched
+            if p.suffix.lower() != ".md": 
+              continue
+
+            valid_name, name_msg = check_filename(p)
+            rel = p.as_posix()
+            if not valid_name:
+              ok = False
+              report_lines.append(f"- ❌ **{rel}** — {name_msg}")
+              continue
+
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            fm, err = parse_front_matter(text) if "README" not in p.name else ({}, None)
+            if err:
+              ok = False
+              report_lines.append(f"- ❌ **{rel}** — Front matter invalid: {err}")
+              continue
+
+            if fm is not None:
+              missing = [k for k in required_front_matter_keys if k not in fm]
+              if missing:
+                ok = False
+                report_lines.append(f"- ❌ **{rel}** — Front matter missing keys: {', '.join(missing)}")
+              else:
+                report_lines.append(f"- ✅ **{rel}** — Filename & front matter OK")
+            else:
+              # README 不强制 front matter
+              report_lines.append(f"- ✅ **{rel}** — Filename OK (README/front matter not required)")
+
+          reports_dir = pathlib.Path("growth/reports")
+          reports_dir.mkdir(parents=True, exist_ok=True)
+
+          report_path = reports_dir / f"GrowthDocs_CI_Report_{datetime.datetime.utcnow().strftime('%Y-%m-%d_%H%M')}.md"
+          header = f"# Growth Docs CI Report\n\n- Time: {now}\n- Files checked: {len(md_files)}\n\n## Results\n"
+          report = header + "\n".join(report_lines) + ("\n\nAll checks passed." if ok else "\n\nOne or more checks failed.")
+          report_path.write_text(report, encoding="utf-8")
+          print(report)
+
+          # Write a short summary for GitHub step outputs
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"ok={'true' if ok else 'false'}\n")
+            f.write(f"report_path={report_path.as_posix()}\n")
+
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Upload CI report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: growth-docs-ci-report
+          path: growth/reports/GrowthDocs_CI_Report_*.md
+
+  # Optional: summary
+  summarize:
+    if: always()
+    needs: [validate-growth-docs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo result
+        run: echo "Growth Docs CI finished."
